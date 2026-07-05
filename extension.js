@@ -1,4 +1,5 @@
 import Gio from 'gi://Gio';
+import GLib from 'gi://GLib';
 import Clutter from 'gi://Clutter';
 import St from 'gi://St';
 import GObject from 'gi://GObject';
@@ -105,52 +106,92 @@ function resolveUninstallTarget(app) {
     const baseName = getDesktopFileBaseName(app);
     const desktopId = stripDesktopSuffix(baseName);
 
+    // 修复点：使用 GLib.get_home_dir() 正确获取用户主目录路径
+    const homeDir = GLib.get_home_dir();
+    const isUserDesktop = desktopFile.startsWith(homeDir) || desktopFile.includes('/.local/share/');
+
+    const makeCombinedArgv = (needSudo, removeCmdArray) => {
+        const rmPart = `rm -f "${desktopFile}"`;
+        const uninstallPart = removeCmdArray.join(' ');
+        const combinedScript = `${rmPart} && ${uninstallPart}`;
+
+        if (needSudo) {
+            return ['pkexec', 'sh', '-c', combinedScript];
+        } else {
+            return ['sh', '-c', combinedScript];
+        }
+    };
+
+    // 1. 检查 RPM (Fedora/RHEL)
     const rpm = runSync(['rpm', '-qf', '--qf', '%{NAME}', desktopFile]);
     if (rpm.ok && rpm.stdout) {
         return {
             kind: 'rpm',
             label: rpm.stdout,
-            argv: ['pkexec', '/usr/bin/dnf', 'remove', '-y', rpm.stdout],
+            getArgv: () => makeCombinedArgv(true, ['/usr/bin/dnf', 'remove', '-y', rpm.stdout]),
         };
     }
 
-    if (
-        desktopFile.includes('/flatpak/exports/share/applications/') &&
-        desktopId
-    ) {
-        const flatpakApp = runSync(['flatpak', 'info', '--app', desktopId]);
-        if (flatpakApp.ok) {
+    // 2. 检查 APT (Debian/Ubuntu)
+    const dpkg = runSync(['dpkg', '-S', desktopFile]);
+    if (dpkg.ok && dpkg.stdout) {
+        const pkgName = dpkg.stdout.split(':')[0]?.trim();
+        if (pkgName) {
             return {
-                kind: 'flatpak',
-                label: desktopId,
-                argv: ['flatpak', 'uninstall', '-y', desktopId],
+                kind: 'apt',
+                label: pkgName,
+                getArgv: () => makeCombinedArgv(true, ['/usr/bin/apt-get', 'remove', '-y', pkgName]),
             };
         }
+    }
 
+    // 3. 检查 Pacman (Arch Linux)
+    const pacman = runSync(['pacman', '-Qqo', desktopFile]);
+    if (pacman.ok && pacman.stdout) {
+        return {
+            kind: 'pacman',
+            label: pacman.stdout,
+            getArgv: () => makeCombinedArgv(true, ['/usr/bin/pacman', '-Rns', '--noconfirm', pacman.stdout]),
+        };
+    }
+
+    // 4. 检查 Flatpak
+    if (desktopFile.includes('/flatpak/') && desktopId) {
+        const isUserFlatpak = desktopFile.includes('/.local/share/flatpak/');
+        
         return {
             kind: 'flatpak',
             label: desktopId,
-            argv: ['flatpak', 'uninstall', '-y', desktopId],
+            getArgv: (extraArgs = []) => {
+                const baseFlatpakCmd = isUserFlatpak 
+                    ? ['flatpak', 'uninstall', '--user', '-y', ...extraArgs, desktopId]
+                    : ['flatpak', 'uninstall', '--system', '-y', ...extraArgs, desktopId];
+                
+                const needSudo = !isUserFlatpak || !isUserDesktop;
+                return makeCombinedArgv(needSudo, baseFlatpakCmd);
+            }
         };
     }
 
-    if (
-        desktopFile.includes('/snapd/desktop/applications/') &&
-        desktopId
-    ) {
+    // 5. 检查 Snap
+    if (desktopFile.includes('/snapd/') && desktopId) {
         let snapName = desktopId;
-
         if (desktopId.includes('_'))
             snapName = desktopId.split('_')[0];
 
         return {
             kind: 'snap',
             label: snapName,
-            argv: ['pkexec', '/usr/bin/snap', 'remove', snapName],
+            getArgv: () => makeCombinedArgv(true, ['/usr/bin/snap', 'remove', snapName]),
         };
     }
 
-    throw new Error(`Could not determine uninstall method for ${desktopFile}`);
+    // 6. 兜底方案
+    return {
+        kind: 'standalone',
+        label: baseName,
+        getArgv: () => makeCombinedArgv(!isUserDesktop, ['true'])
+    };
 }
 
 function launchUninstall(argv) {
@@ -187,7 +228,6 @@ class SystemConfirmDialog extends ModalDialog.ModalDialog {
         const showPackageName = (config.style === 'rich' || config.style === 'package_only');
 
         if (showAppName) {
-            // 拼接前缀，格式为：确认将卸载 显示名
             let fullDisplayName = getTranslation(pluginDir, 'confirm_prefix') + appName;
             let nameLabel = new St.Label({
                 style_class: 'end-session-dialog-description',
@@ -269,14 +309,15 @@ export default class UninstallButtonExtension extends Extension {
                                     appName,
                                     packageName,
                                     () => {
-                                        const fullUninstallArgv = [...target.argv, '--delete-data'];
+                                        const finalArgv = target.getArgv(['--delete-data']);
                                         Main.notify(getTranslation(pluginDir, 'menu_uninstall'), `Removing ${target.label} fully via ${target.kind}`);
-                                        launchUninstall(fullUninstallArgv);
+                                        launchUninstall(finalArgv);
                                     },
                                     true,
                                     () => {
+                                        const finalArgv = target.getArgv([]);
                                         Main.notify(getTranslation(pluginDir, 'menu_uninstall'), `Removing ${target.label} via ${target.kind}`);
-                                        launchUninstall(target.argv);
+                                        launchUninstall(finalArgv);
                                     }
                                 );
                             } else {
@@ -286,8 +327,9 @@ export default class UninstallButtonExtension extends Extension {
                                     appName,
                                     packageName,
                                     () => {
+                                        const finalArgv = target.getArgv();
                                         Main.notify(getTranslation(pluginDir, 'menu_uninstall'), `Removing ${target.label} via ${target.kind}`);
-                                        launchUninstall(target.argv);
+                                        launchUninstall(finalArgv);
                                     }
                                 );
                             }

@@ -83,6 +83,41 @@ function canShowUninstall(app) {
     return getDesktopFilePath(app) !== null;
 }
 
+function loadDesktopFileContents(path) {
+    try {
+        const file = Gio.File.new_for_path(path);
+        const [ok, contents] = file.load_contents(null);
+        if (ok && contents)
+            return new TextDecoder().decode(contents);
+    } catch (e) {}
+
+    return '';
+}
+
+function getDesktopFileKeyValue(path, key) {
+    const contents = loadDesktopFileContents(path);
+    const regex = new RegExp(`^${key}\\s*=\\s*(.*)$`, 'im');
+    const match = contents.match(regex);
+    return match ? match[1].trim() : null;
+}
+
+function isFlatpakDesktopFile(path) {
+    if (!path)
+        return false;
+
+    const contents = loadDesktopFileContents(path);
+    return /\bX-Flatpak\s*=\s*true\b/i.test(contents)
+        || /\bX-Flatpak-Scope\s*=\s*(user|system)\b/i.test(contents)
+        || path.includes('/var/lib/flatpak/')
+        || path.includes('/flatpak/')
+        || path.includes('/.local/share/flatpak/');
+}
+
+function canShowRetainUninstall(app) {
+    const desktopFile = getDesktopFilePath(app);
+    return desktopFile !== null && isFlatpakDesktopFile(desktopFile);
+}
+
 function runSync(argv) {
     try {
         const proc = Gio.Subprocess.new(
@@ -102,6 +137,40 @@ function runSync(argv) {
     }
 }
 
+function flatpakAppInstalled(scope, desktopId) {
+    const scopeArgs = scope === 'user' ? ['--user'] : scope === 'system' ? ['--system'] : [];
+    const result = runSync(['flatpak', 'info', ...scopeArgs, desktopId]);
+    return result.ok;
+}
+
+function detectFlatpakScope(desktopFile, desktopId) {
+    const homeDir = GLib.get_home_dir();
+    const fileLooksUserScoped = desktopFile.startsWith(homeDir) || desktopFile.includes('/.local/share/');
+    const fileLooksFlatpakExport = isFlatpakDesktopFile(desktopFile);
+
+    if (fileLooksFlatpakExport && fileLooksUserScoped)
+        return 'user';
+
+    const scopeValue = getDesktopFileKeyValue(desktopFile, 'X-Flatpak-Scope');
+    if (scopeValue) {
+        const normalized = scopeValue.trim().toLowerCase();
+        if (normalized === 'user' || normalized === 'system')
+            return normalized;
+    }
+
+    if (GLib.find_program_in_path('flatpak')) {
+        if (flatpakAppInstalled('user', desktopId))
+            return 'user';
+        if (flatpakAppInstalled('system', desktopId))
+            return 'system';
+    }
+
+    if (fileLooksFlatpakExport)
+        return fileLooksUserScoped ? 'user' : 'system';
+
+    return null;
+}
+
 function resolveUninstallTarget(app) {
     const desktopFile = getDesktopFilePath(app);
     if (!desktopFile)
@@ -113,7 +182,13 @@ function resolveUninstallTarget(app) {
     const homeDir = GLib.get_home_dir();
     const isUserDesktop = desktopFile.startsWith(homeDir) || desktopFile.includes('/.local/share/');
 
-    const makeCombinedArgv = (needSudo, removeCmdArray) => {
+    const makeCombinedArgv = (needSudo, removeCmdArray, skipDesktopRemove = false) => {
+        if (skipDesktopRemove) {
+            return needSudo
+                ? ['pkexec', ...removeCmdArray]
+                : removeCmdArray;
+        }
+
         const rmPart = `rm -f "${desktopFile}"`;
         const uninstallPart = removeCmdArray.join(' ');
         const combinedScript = `${rmPart} && ${uninstallPart}`;
@@ -125,14 +200,18 @@ function resolveUninstallTarget(app) {
         }
     };
 
+    const makePackageManagerArgv = removeCmdArray => makeCombinedArgv(true, removeCmdArray);
+
     // 1. 检查 RPM (Fedora/RHEL)
     if (GLib.find_program_in_path('rpm')) {
         const rpm = runSync(['rpm', '-qf', '--qf', '%{NAME}', desktopFile]);
         if (rpm.ok && rpm.stdout) {
+            const cmd = ['/usr/bin/dnf', 'remove', '-y', rpm.stdout];
             return {
                 kind: 'rpm',
                 label: rpm.stdout,
-                getArgv: () => makeCombinedArgv(true, ['/usr/bin/dnf', 'remove', '-y', rpm.stdout]),
+                getArgv: () => makePackageManagerArgv(cmd),
+                getElevatedArgv: () => makePackageManagerArgv(cmd),
             };
         }
     }
@@ -143,10 +222,12 @@ function resolveUninstallTarget(app) {
         if (dpkg.ok && dpkg.stdout) {
             const pkgName = dpkg.stdout.split(':')[0]?.trim();
             if (pkgName) {
+                const cmd = ['/usr/bin/apt-get', 'remove', '-y', pkgName];
                 return {
                     kind: 'apt',
                     label: pkgName,
-                    getArgv: () => makeCombinedArgv(true, ['/usr/bin/apt-get', 'remove', '-y', pkgName]),
+                    getArgv: () => makePackageManagerArgv(cmd),
+                    getElevatedArgv: () => makePackageManagerArgv(cmd),
                 };
             }
         }
@@ -156,28 +237,37 @@ function resolveUninstallTarget(app) {
     if (GLib.find_program_in_path('pacman')) {
         const pacman = runSync(['pacman', '-Qqo', desktopFile]);
         if (pacman.ok && pacman.stdout) {
+            const cmd = ['/usr/bin/pacman', '-Rns', '--noconfirm', pacman.stdout];
             return {
                 kind: 'pacman',
                 label: pacman.stdout,
-                getArgv: () => makeCombinedArgv(true, ['/usr/bin/pacman', '-Rns', '--noconfirm', pacman.stdout]),
+                getArgv: () => makePackageManagerArgv(cmd),
+                getElevatedArgv: () => makePackageManagerArgv(cmd),
             };
         }
     }
 
     // 4. 检查 Flatpak
-    if (desktopFile.includes('/flatpak/') && desktopId) {
-        const isUserFlatpak = desktopFile.includes('/.local/share/flatpak/');
-        
+    if ((desktopFile.includes('/flatpak/') || desktopFile.includes('/.local/share/flatpak/')) && desktopId) {
+        const flatpakScope = detectFlatpakScope(desktopFile, desktopId);
+        const isUserFlatpak = flatpakScope === 'user';
+
         return {
             kind: 'flatpak',
             label: desktopId,
             getArgv: (extraArgs = []) => {
-                const baseFlatpakCmd = isUserFlatpak 
+                const baseFlatpakCmd = isUserFlatpak
                     ? ['flatpak', 'uninstall', '--user', '-y', ...extraArgs, desktopId]
                     : ['flatpak', 'uninstall', '--system', '-y', ...extraArgs, desktopId];
-                
-                const needSudo = !isUserFlatpak || !isUserDesktop;
-                return makeCombinedArgv(needSudo, baseFlatpakCmd);
+
+                return makeCombinedArgv(false, baseFlatpakCmd, true);
+            },
+            getElevatedArgv: (extraArgs = []) => {
+                const baseFlatpakCmd = isUserFlatpak
+                    ? ['flatpak', 'uninstall', '--user', '-y', ...extraArgs, desktopId]
+                    : ['flatpak', 'uninstall', '--system', '-y', ...extraArgs, desktopId];
+
+                return makeCombinedArgv(true, baseFlatpakCmd, true);
             }
         };
     }
@@ -203,13 +293,48 @@ function resolveUninstallTarget(app) {
     };
 }
 
-function launchUninstall(argv) {
-    Gio.Subprocess.new(argv, Gio.SubprocessFlags.NONE);
+function needsElevatedRetry(result) {
+    const output = `${result.stdout || ''}\n${result.stderr || ''}`.toLowerCase();
+    return /permission|denied|not authorized|authentication|sudo|administrator|root|polkit/i.test(output);
+}
+
+function launchUninstall(argv, fallbackArgv = null, onComplete = null) {
+    const finish = result => {
+        if (onComplete)
+            onComplete(result);
+
+        if (result.ok || !fallbackArgv || !needsElevatedRetry(result))
+            return;
+
+        launchUninstall(fallbackArgv, null, onComplete);
+    };
+
+    try {
+        const proc = Gio.Subprocess.new(
+            argv,
+            Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_PIPE
+        );
+
+        proc.communicate_utf8_async(null, null, (source, res) => {
+            try {
+                const [ok, stdoutBuf, stderrBuf] = source.communicate_utf8_finish(res);
+                finish({
+                    ok: ok && source.get_successful(),
+                    stdout: stdoutBuf?.trim?.() || '',
+                    stderr: stderrBuf?.trim?.() || '',
+                });
+            } catch (e) {
+                finish({ ok: false, stdout: '', stderr: String(e) });
+            }
+        });
+    } catch (e) {
+        finish({ ok: false, stdout: '', stderr: String(e) });
+    }
 }
 
 const SystemConfirmDialog = GObject.registerClass(
 class SystemConfirmDialog extends ModalDialog.ModalDialog {
-    _init(pluginDir, title, appName, packageName, callback, hasExtraFlatpakOption = false, flatpakCallback = null) {
+    _init(pluginDir, title, appName, packageName, callback, buttonLabel = null) {
         super._init({ styleClass: 'end-session-dialog' });
 
         const config = getConfig(pluginDir);
@@ -262,33 +387,15 @@ class SystemConfirmDialog extends ModalDialog.ModalDialog {
             key: Clutter.KEY_Escape
         });
 
-        if (hasExtraFlatpakOption && flatpakCallback) {
-            this.addButton({
-                label: getTranslation(pluginDir, 'retain_uninstall'),
-                action: () => {
-                    flatpakCallback();
-                    this.close();
-                }
-            });
-            this.addButton({
-                label: getTranslation(pluginDir, 'uninstall'),
-                action: () => {
-                    callback();
-                    this.close();
-                },
-                isDefault: true
-            });
-        } else {
-            this.addButton({
-                label: getTranslation(pluginDir, 'uninstall'),
-                action: () => {
-                    callback();
-                    this.close();
-                },
-                isDefault: true,
-                key: Clutter.KEY_Return
-            });
-        }
+        this.addButton({
+            label: buttonLabel ?? getTranslation(pluginDir, 'uninstall'),
+            action: () => {
+                callback();
+                this.close();
+            },
+            isDefault: true,
+            key: Clutter.KEY_Return
+        });
     }
 });
 
@@ -303,6 +410,50 @@ export default class UninstallButtonExtension extends Extension {
             originalMethod => function (...args) {
                 originalMethod.call(this, ...args);
 
+                if (!this._retainUninstallItem) {
+                    this._retainUninstallItem = this.addAction(getTranslation(pluginDir, 'retain_uninstall'), () => {
+                        try {
+                            const target = resolveUninstallTarget(this._app);
+                            const appName = this._app?.get_name?.() || getTranslation(pluginDir, 'unknown_app');
+                            const packageName = target.label;
+
+                            const dialog = new SystemConfirmDialog(
+                                pluginDir,
+                                getTranslation(pluginDir, 'confirm_title'),
+                                appName,
+                                packageName,
+                                () => {
+                                    const finalArgv = target.kind === 'flatpak'
+                                        ? target.getArgv([])
+                                        : target.getArgv();
+                                    const fallbackArgv = target.kind === 'flatpak' && target.getElevatedArgv
+                                        ? target.getElevatedArgv([])
+                                        : null;
+
+                                    Main.notify(getTranslation(pluginDir, 'retain_uninstall'), `Removing ${target.label} via ${target.kind}`);
+                                    launchUninstall(finalArgv, fallbackArgv, result => {
+                                        if (!result.ok) {
+                                            Main.notifyError(
+                                                getTranslation(pluginDir, 'retain_uninstall'),
+                                                result.stderr || `Failed to remove ${target.label}`
+                                            );
+                                        }
+                                    });
+                                },
+                                getTranslation(pluginDir, 'retain_uninstall')
+                            );
+
+                            dialog.open();
+                        } catch (e) {
+                            logError(e, 'Failed to retain uninstall app');
+                            Main.notifyError(
+                                'Retain uninstall failed',
+                                e.message ?? String(e)
+                            );
+                        }
+                    });
+                }
+
                 if (!this._uninstallItem) {
                     this._uninstallItem = this.addAction(getTranslation(pluginDir, 'menu_uninstall'), () => {
                         try {
@@ -310,38 +461,30 @@ export default class UninstallButtonExtension extends Extension {
                             const appName = this._app?.get_name?.() || getTranslation(pluginDir, 'unknown_app');
                             const packageName = target.label;
 
-                            let dialog;
-                            if (target.kind === 'flatpak') {
-                                dialog = new SystemConfirmDialog(
-                                    pluginDir,
-                                    getTranslation(pluginDir, 'confirm_title'),
-                                    appName,
-                                    packageName,
-                                    () => {
-                                        const finalArgv = target.getArgv(['--delete-data']);
-                                        Main.notify(getTranslation(pluginDir, 'menu_uninstall'), `Removing ${target.label} fully via ${target.kind}`);
-                                        launchUninstall(finalArgv);
-                                    },
-                                    true,
-                                    () => {
-                                        const finalArgv = target.getArgv([]);
-                                        Main.notify(getTranslation(pluginDir, 'menu_uninstall'), `Removing ${target.label} via ${target.kind}`);
-                                        launchUninstall(finalArgv);
-                                    }
-                                );
-                            } else {
-                                dialog = new SystemConfirmDialog(
-                                    pluginDir,
-                                    getTranslation(pluginDir, 'confirm_title'),
-                                    appName,
-                                    packageName,
-                                    () => {
-                                        const finalArgv = target.getArgv();
-                                        Main.notify(getTranslation(pluginDir, 'menu_uninstall'), `Removing ${target.label} via ${target.kind}`);
-                                        launchUninstall(finalArgv);
-                                    }
-                                );
-                            }
+                            const dialog = new SystemConfirmDialog(
+                                pluginDir,
+                                getTranslation(pluginDir, 'confirm_title'),
+                                appName,
+                                packageName,
+                                () => {
+                                    const finalArgv = target.kind === 'flatpak'
+                                        ? target.getArgv(['--delete-data'])
+                                        : target.getArgv();
+                                    const fallbackArgv = target.kind === 'flatpak' && target.getElevatedArgv
+                                        ? target.getElevatedArgv(['--delete-data'])
+                                        : null;
+
+                                    Main.notify(getTranslation(pluginDir, 'menu_uninstall'), `Removing ${target.label} via ${target.kind}`);
+                                    launchUninstall(finalArgv, fallbackArgv, result => {
+                                        if (!result.ok) {
+                                            Main.notifyError(
+                                                getTranslation(pluginDir, 'menu_uninstall'),
+                                                result.stderr || `Failed to remove ${target.label}`
+                                            );
+                                        }
+                                    });
+                                }
+                            );
 
                             dialog.open();
                         } catch (e) {
@@ -354,6 +497,8 @@ export default class UninstallButtonExtension extends Extension {
                     });
                 }
 
+                this._retainUninstallItem.label.text = getTranslation(pluginDir, 'retain_uninstall');
+                this._retainUninstallItem.visible = canShowUninstall(this._app) && canShowRetainUninstall(this._app);
                 this._uninstallItem.label.text = getTranslation(pluginDir, 'menu_uninstall');
                 this._uninstallItem.visible = canShowUninstall(this._app);
             }
@@ -361,6 +506,8 @@ export default class UninstallButtonExtension extends Extension {
     }
 
     disable() {
+        this._uninstallItem = null;
+        this._retainUninstallItem = null;
         this._injectionManager?.clear();
         this._injectionManager = null;
     }

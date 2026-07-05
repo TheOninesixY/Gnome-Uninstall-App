@@ -84,18 +84,22 @@ function canShowUninstall(app) {
 }
 
 function runSync(argv) {
-    const proc = Gio.Subprocess.new(
-        argv,
-        Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_PIPE
-    );
+    try {
+        const proc = Gio.Subprocess.new(
+            argv,
+            Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_PIPE
+        );
 
-    const [ok, stdoutBuf, stderrBuf] = proc.communicate_utf8(null, null);
+        const [ok, stdoutBuf, stderrBuf] = proc.communicate_utf8(null, null);
 
-    return {
-        ok: ok && proc.get_successful(),
-        stdout: stdoutBuf?.trim?.() || '',
-        stderr: stderrBuf?.trim?.() || '',
-    };
+        return {
+            ok: ok && proc.get_successful(),
+            stdout: stdoutBuf?.trim?.() || '',
+            stderr: stderrBuf?.trim?.() || '',
+        };
+    } catch (e) {
+        return { ok: false, stdout: '', stderr: String(e) };
+    }
 }
 
 function resolveUninstallTarget(app) {
@@ -106,7 +110,6 @@ function resolveUninstallTarget(app) {
     const baseName = getDesktopFileBaseName(app);
     const desktopId = stripDesktopSuffix(baseName);
 
-    // 修复点：使用 GLib.get_home_dir() 正确获取用户主目录路径
     const homeDir = GLib.get_home_dir();
     const isUserDesktop = desktopFile.startsWith(homeDir) || desktopFile.includes('/.local/share/');
 
@@ -123,36 +126,42 @@ function resolveUninstallTarget(app) {
     };
 
     // 1. 检查 RPM (Fedora/RHEL)
-    const rpm = runSync(['rpm', '-qf', '--qf', '%{NAME}', desktopFile]);
-    if (rpm.ok && rpm.stdout) {
-        return {
-            kind: 'rpm',
-            label: rpm.stdout,
-            getArgv: () => makeCombinedArgv(true, ['/usr/bin/dnf', 'remove', '-y', rpm.stdout]),
-        };
-    }
-
-    // 2. 检查 APT (Debian/Ubuntu)
-    const dpkg = runSync(['dpkg', '-S', desktopFile]);
-    if (dpkg.ok && dpkg.stdout) {
-        const pkgName = dpkg.stdout.split(':')[0]?.trim();
-        if (pkgName) {
+    if (GLib.find_program_in_path('rpm')) {
+        const rpm = runSync(['rpm', '-qf', '--qf', '%{NAME}', desktopFile]);
+        if (rpm.ok && rpm.stdout) {
             return {
-                kind: 'apt',
-                label: pkgName,
-                getArgv: () => makeCombinedArgv(true, ['/usr/bin/apt-get', 'remove', '-y', pkgName]),
+                kind: 'rpm',
+                label: rpm.stdout,
+                getArgv: () => makeCombinedArgv(true, ['/usr/bin/dnf', 'remove', '-y', rpm.stdout]),
             };
         }
     }
 
+    // 2. 检查 APT (Debian/Ubuntu)
+    if (GLib.find_program_in_path('dpkg')) {
+        const dpkg = runSync(['dpkg', '-S', desktopFile]);
+        if (dpkg.ok && dpkg.stdout) {
+            const pkgName = dpkg.stdout.split(':')[0]?.trim();
+            if (pkgName) {
+                return {
+                    kind: 'apt',
+                    label: pkgName,
+                    getArgv: () => makeCombinedArgv(true, ['/usr/bin/apt-get', 'remove', '-y', pkgName]),
+                };
+            }
+        }
+    }
+
     // 3. 检查 Pacman (Arch Linux)
-    const pacman = runSync(['pacman', '-Qqo', desktopFile]);
-    if (pacman.ok && pacman.stdout) {
-        return {
-            kind: 'pacman',
-            label: pacman.stdout,
-            getArgv: () => makeCombinedArgv(true, ['/usr/bin/pacman', '-Rns', '--noconfirm', pacman.stdout]),
-        };
+    if (GLib.find_program_in_path('pacman')) {
+        const pacman = runSync(['pacman', '-Qqo', desktopFile]);
+        if (pacman.ok && pacman.stdout) {
+            return {
+                kind: 'pacman',
+                label: pacman.stdout,
+                getArgv: () => makeCombinedArgv(true, ['/usr/bin/pacman', '-Rns', '--noconfirm', pacman.stdout]),
+            };
+        }
     }
 
     // 4. 检查 Flatpak

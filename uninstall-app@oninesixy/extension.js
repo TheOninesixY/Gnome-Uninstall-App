@@ -113,45 +113,93 @@ function isFlatpakDesktopFile(path) {
         || path.includes('/.local/share/flatpak/');
 }
 
+// Async helpers: non-blocking file readers and key/value extractors
+function loadDesktopFileContentsAsync(path) {
+    return new Promise(resolve => {
+        try {
+            const file = Gio.File.new_for_path(path);
+            file.load_contents_async(null, (f, res) => {
+                try {
+                    const [ok, contents] = f.load_contents_finish(res);
+                    if (ok && contents)
+                        resolve(new TextDecoder().decode(contents));
+                    else
+                        resolve('');
+                } catch (e) {
+                    resolve('');
+                }
+            });
+        } catch (e) {
+            resolve('');
+        }
+    });
+}
+
+async function getDesktopFileKeyValueAsync(path, key) {
+    const contents = await loadDesktopFileContentsAsync(path);
+    const regex = new RegExp(`^${key}\\s*=\\s*(.*)$`, 'im');
+    const match = contents.match(regex);
+    return match ? match[1].trim() : null;
+}
+
+async function isFlatpakDesktopFileAsync(path) {
+    if (!path)
+        return false;
+
+    const contents = await loadDesktopFileContentsAsync(path);
+    return /\bX-Flatpak\s*=\s*true\b/i.test(contents)
+        || /\bX-Flatpak-Scope\s*=\s*(user|system)\b/i.test(contents)
+        || path.includes('/var/lib/flatpak/')
+        || path.includes('/flatpak/')
+        || path.includes('/.local/share/flatpak/');
+}
+
 function canShowRetainUninstall(app) {
     const desktopFile = getDesktopFilePath(app);
     return desktopFile !== null && isFlatpakDesktopFile(desktopFile);
 }
 
-function runSync(argv) {
-    try {
-        const proc = Gio.Subprocess.new(
-            argv,
-            Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_PIPE
-        );
+function runAsync(argv) {
+    return new Promise(resolve => {
+        try {
+            const proc = Gio.Subprocess.new(
+                argv,
+                Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_PIPE
+            );
 
-        const [ok, stdoutBuf, stderrBuf] = proc.communicate_utf8(null, null);
-
-        return {
-            ok: ok && proc.get_successful(),
-            stdout: stdoutBuf?.trim?.() || '',
-            stderr: stderrBuf?.trim?.() || '',
-        };
-    } catch (e) {
-        return { ok: false, stdout: '', stderr: String(e) };
-    }
+            proc.communicate_utf8_async(null, null, (source, res) => {
+                try {
+                    const [ok, stdoutBuf, stderrBuf] = source.communicate_utf8_finish(res);
+                    resolve({
+                        ok: ok && source.get_successful(),
+                        stdout: stdoutBuf?.trim?.() || '',
+                        stderr: stderrBuf?.trim?.() || '',
+                    });
+                } catch (e) {
+                    resolve({ ok: false, stdout: '', stderr: String(e) });
+                }
+            });
+        } catch (e) {
+            resolve({ ok: false, stdout: '', stderr: String(e) });
+        }
+    });
 }
 
-function flatpakAppInstalled(scope, desktopId) {
+async function flatpakAppInstalled(scope, desktopId) {
     const scopeArgs = scope === 'user' ? ['--user'] : scope === 'system' ? ['--system'] : [];
-    const result = runSync(['flatpak', 'info', ...scopeArgs, desktopId]);
+    const result = await runAsync(['flatpak', 'info', ...scopeArgs, desktopId]);
     return result.ok;
 }
 
-function detectFlatpakScope(desktopFile, desktopId) {
+async function detectFlatpakScope(desktopFile, desktopId) {
     const homeDir = GLib.get_home_dir();
     const fileLooksUserScoped = desktopFile.startsWith(homeDir) || desktopFile.includes('/.local/share/');
-    const fileLooksFlatpakExport = isFlatpakDesktopFile(desktopFile);
+    const fileLooksFlatpakExport = await isFlatpakDesktopFileAsync(desktopFile);
 
     if (fileLooksFlatpakExport && fileLooksUserScoped)
         return 'user';
 
-    const scopeValue = getDesktopFileKeyValue(desktopFile, 'X-Flatpak-Scope');
+    const scopeValue = await getDesktopFileKeyValueAsync(desktopFile, 'X-Flatpak-Scope');
     if (scopeValue) {
         const normalized = scopeValue.trim().toLowerCase();
         if (normalized === 'user' || normalized === 'system')
@@ -159,9 +207,9 @@ function detectFlatpakScope(desktopFile, desktopId) {
     }
 
     if (GLib.find_program_in_path('flatpak')) {
-        if (flatpakAppInstalled('user', desktopId))
+        if (await flatpakAppInstalled('user', desktopId))
             return 'user';
-        if (flatpakAppInstalled('system', desktopId))
+        if (await flatpakAppInstalled('system', desktopId))
             return 'system';
     }
 
@@ -171,7 +219,7 @@ function detectFlatpakScope(desktopFile, desktopId) {
     return null;
 }
 
-function resolveUninstallTarget(app) {
+async function resolveUninstallTargetAsync(app) {
     const desktopFile = getDesktopFilePath(app);
     if (!desktopFile)
         throw new Error('No desktop file path for this app');
@@ -204,7 +252,7 @@ function resolveUninstallTarget(app) {
 
     // 1. 检查 RPM (Fedora/RHEL)
     if (GLib.find_program_in_path('rpm')) {
-        const rpm = runSync(['rpm', '-qf', '--qf', '%{NAME}', desktopFile]);
+        const rpm = await runAsync(['rpm', '-qf', '--qf', '%{NAME}', desktopFile]);
         if (rpm.ok && rpm.stdout) {
             const cmd = ['/usr/bin/dnf', 'remove', '-y', rpm.stdout];
             return {
@@ -218,7 +266,7 @@ function resolveUninstallTarget(app) {
 
     // 2. 检查 APT (Debian/Ubuntu)
     if (GLib.find_program_in_path('dpkg')) {
-        const dpkg = runSync(['dpkg', '-S', desktopFile]);
+        const dpkg = await runAsync(['dpkg', '-S', desktopFile]);
         if (dpkg.ok && dpkg.stdout) {
             const pkgName = dpkg.stdout.split(':')[0]?.trim();
             if (pkgName) {
@@ -235,7 +283,7 @@ function resolveUninstallTarget(app) {
 
     // 3. 检查 Pacman (Arch Linux)
     if (GLib.find_program_in_path('pacman')) {
-        const pacman = runSync(['pacman', '-Qqo', desktopFile]);
+        const pacman = await runAsync(['pacman', '-Qqo', desktopFile]);
         if (pacman.ok && pacman.stdout) {
             const cmd = ['/usr/bin/pacman', '-Rns', '--noconfirm', pacman.stdout];
             return {
@@ -249,7 +297,7 @@ function resolveUninstallTarget(app) {
 
     // 4. 检查 Flatpak
     if ((desktopFile.includes('/flatpak/') || desktopFile.includes('/.local/share/flatpak/')) && desktopId) {
-        const flatpakScope = detectFlatpakScope(desktopFile, desktopId);
+        const flatpakScope = await detectFlatpakScope(desktopFile, desktopId);
         const isUserFlatpak = flatpakScope === 'user';
 
         return {
@@ -411,9 +459,9 @@ export default class UninstallButtonExtension extends Extension {
                 originalMethod.call(this, ...args);
 
                 if (!this._retainUninstallItem) {
-                    this._retainUninstallItem = this.addAction(getTranslation(pluginDir, 'retain_uninstall'), () => {
+                    this._retainUninstallItem = this.addAction(getTranslation(pluginDir, 'retain_uninstall'), async () => {
                         try {
-                            const target = resolveUninstallTarget(this._app);
+                            const target = await resolveUninstallTargetAsync(this._app);
                             const appName = this._app?.get_name?.() || getTranslation(pluginDir, 'unknown_app');
                             const packageName = target.label;
 
@@ -455,9 +503,9 @@ export default class UninstallButtonExtension extends Extension {
                 }
 
                 if (!this._uninstallItem) {
-                    this._uninstallItem = this.addAction(getTranslation(pluginDir, 'menu_uninstall'), () => {
+                    this._uninstallItem = this.addAction(getTranslation(pluginDir, 'menu_uninstall'), async () => {
                         try {
-                            const target = resolveUninstallTarget(this._app);
+                            const target = await resolveUninstallTargetAsync(this._app);
                             const appName = this._app?.get_name?.() || getTranslation(pluginDir, 'unknown_app');
                             const packageName = target.label;
 
@@ -497,10 +545,22 @@ export default class UninstallButtonExtension extends Extension {
                     });
                 }
 
-                this._retainUninstallItem.label.text = getTranslation(pluginDir, 'retain_uninstall');
-                this._retainUninstallItem.visible = canShowUninstall(this._app) && canShowRetainUninstall(this._app);
+                const canUninstall = canShowUninstall(this._app);
                 this._uninstallItem.label.text = getTranslation(pluginDir, 'menu_uninstall');
-                this._uninstallItem.visible = canShowUninstall(this._app);
+                this._uninstallItem.visible = canUninstall;
+
+                this._retainUninstallItem.label.text = getTranslation(pluginDir, 'retain_uninstall');
+                this._retainUninstallItem.visible = false;
+                if (canUninstall) {
+                    const desktopFile = getDesktopFilePath(this._app);
+                    if (desktopFile) {
+                        isFlatpakDesktopFileAsync(desktopFile).then(isFlatpak => {
+                            this._retainUninstallItem.visible = isFlatpak;
+                        }).catch(() => {
+                            this._retainUninstallItem.visible = false;
+                        });
+                    }
+                }
             }
         );
     }

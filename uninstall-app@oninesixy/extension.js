@@ -236,16 +236,37 @@ async function resolveUninstallTargetAsync(app) {
     const homeDir = GLib.get_home_dir();
     const isUserDesktop = desktopFile.startsWith(homeDir) || desktopFile.includes('/.local/share/');
 
-    const makeCombinedArgv = (needSudo, removeCmdArray, skipDesktopRemove = false) => {
-        if (skipDesktopRemove) {
+    const makeCombinedArgv = (needSudo, removeCmdArray, skipDesktopHide = false) => {
+        const uninstallPart = removeCmdArray.join(' ');
+
+        if (skipDesktopHide) {
             return needSudo
-                ? ['pkexec', ...removeCmdArray]
-                : removeCmdArray;
+                ? ['pkexec', 'sh', '-c', uninstallPart]
+                : ['sh', '-c', uninstallPart];
         }
 
-        const rmPart = `rm -f "${desktopFile}"`;
-        const uninstallPart = removeCmdArray.join(' ');
-        const combinedScript = `${rmPart} && ${uninstallPart}`;
+        const hiddenDesktopFile = `${desktopFile}.hide`;
+        const desktopFileEscaped = GLib.shell_quote(desktopFile);
+        const hiddenDesktopFileEscaped = GLib.shell_quote(hiddenDesktopFile);
+        const combinedScript = `
+            if [ -e ${desktopFileEscaped} ]; then
+                if mv -f ${desktopFileEscaped} ${hiddenDesktopFileEscaped}; then
+                    ${uninstallPart}
+                    rc=$?
+                    if [ $rc -eq 0 ]; then
+                        rm -f ${hiddenDesktopFileEscaped}
+                        exit $?
+                    else
+                        mv -f ${hiddenDesktopFileEscaped} ${desktopFileEscaped}
+                        exit $rc
+                    fi
+                else
+                    exit 1
+                fi
+            else
+                ${uninstallPart}
+            fi
+        `;
 
         if (needSudo) {
             return ['pkexec', 'sh', '-c', combinedScript];

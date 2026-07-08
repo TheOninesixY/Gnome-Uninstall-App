@@ -24,14 +24,14 @@ const I18N = {
         'confirm_title': 'Are you sure you want to uninstall this app?',
         'confirm_prefix': 'Confirm uninstalling ',
         'cancel': 'Cancel',
-        'retain_uninstall': 'Uninstall & Keep Data',
+        'retain_uninstall': 'Keep Data Uninstall',
         'uninstall': 'Uninstall',
         'unknown_app': 'Unknown Application'
     }
 };
 
 function getConfig(pluginDir) {
-    let config = { language: 'zh_CN', style: 'rich' };
+    let config = { language: 'zh_CN', style: 'rich', diyLanguage: {} };
     const configPath = pluginDir.get_path() + '/config.json';
     try {
         const file = Gio.File.new_for_path(configPath);
@@ -41,6 +41,9 @@ function getConfig(pluginDir) {
                 const parsed = JSON.parse(new TextDecoder().decode(content));
                 if (parsed.language) config.language = parsed.language;
                 if (parsed.style) config.style = parsed.style;
+                if (parsed['diy-language'] && typeof parsed['diy-language'] === 'object') {
+                    config.diyLanguage = parsed['diy-language'];
+                }
             }
         }
     } catch (e) {}
@@ -49,7 +52,11 @@ function getConfig(pluginDir) {
 
 function getTranslation(pluginDir, key) {
     const config = getConfig(pluginDir);
-    return I18N[config.language][key] || key;
+    if (config.language === 'DIY' && config.diyLanguage?.[key]) {
+        return config.diyLanguage[key];
+    }
+
+    return I18N[config.language]?.[key] || I18N.zh_CN[key] || key;
 }
 
 function getDesktopFilePath(app) {
@@ -480,12 +487,30 @@ export default class UninstallButtonExtension extends Extension {
     enable() {
         const pluginDir = this.dir;
         this._injectionManager = new InjectionManager();
+        this._trackedMenu = null;
+        this._trackedApp = null;
+
+        const configPath = pluginDir.get_path() + '/config.json';
+        const configFile = Gio.File.new_for_path(configPath);
+        this._configMonitor = configFile.monitor_file(Gio.FileMonitorFlags.NONE, null);
+        this._configMonitor.connect('changed', () => {
+            if (this._trackedMenu && this._trackedApp) {
+                try {
+                    this._trackedMenu.setApp(this._trackedApp);
+                } catch (e) {
+                    logError(e, 'Failed to refresh app menu labels');
+                }
+            }
+        });
 
         this._injectionManager.overrideMethod(
             AppMenu.AppMenu.prototype,
             'setApp',
             originalMethod => function (...args) {
                 originalMethod.call(this, ...args);
+
+                this._trackedMenu = this;
+                this._trackedApp = this._app;
 
                 if (!this._retainUninstallItem) {
                     this._retainUninstallItem = this.addAction(getTranslation(pluginDir, 'retain_uninstall'), async () => {
@@ -597,6 +622,10 @@ export default class UninstallButtonExtension extends Extension {
     disable() {
         this._uninstallItem = null;
         this._retainUninstallItem = null;
+        this._trackedMenu = null;
+        this._trackedApp = null;
+        this._configMonitor?.cancel();
+        this._configMonitor = null;
         this._injectionManager?.clear();
         this._injectionManager = null;
     }

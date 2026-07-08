@@ -227,6 +227,12 @@ async function resolveUninstallTargetAsync(app) {
     const baseName = getDesktopFileBaseName(app);
     const desktopId = stripDesktopSuffix(baseName);
 
+    const safeLabel = label => {
+        if (label && label.trim())
+            return label.trim();
+        return desktopId || baseName || 'unknown';
+    };
+
     const homeDir = GLib.get_home_dir();
     const isUserDesktop = desktopFile.startsWith(homeDir) || desktopFile.includes('/.local/share/');
 
@@ -257,7 +263,7 @@ async function resolveUninstallTargetAsync(app) {
             const cmd = ['/usr/bin/dnf', 'remove', '-y', rpm.stdout];
             return {
                 kind: 'rpm',
-                label: rpm.stdout,
+                label: safeLabel(rpm.stdout),
                 getArgv: () => makePackageManagerArgv(cmd),
                 getElevatedArgv: () => makePackageManagerArgv(cmd),
             };
@@ -273,7 +279,7 @@ async function resolveUninstallTargetAsync(app) {
                 const cmd = ['/usr/bin/apt-get', 'remove', '-y', pkgName];
                 return {
                     kind: 'apt',
-                    label: pkgName,
+                    label: safeLabel(pkgName),
                     getArgv: () => makePackageManagerArgv(cmd),
                     getElevatedArgv: () => makePackageManagerArgv(cmd),
                 };
@@ -288,7 +294,7 @@ async function resolveUninstallTargetAsync(app) {
             const cmd = ['/usr/bin/pacman', '-Rns', '--noconfirm', pacman.stdout];
             return {
                 kind: 'pacman',
-                label: pacman.stdout,
+                label: safeLabel(pacman.stdout),
                 getArgv: () => makePackageManagerArgv(cmd),
                 getElevatedArgv: () => makePackageManagerArgv(cmd),
             };
@@ -302,7 +308,7 @@ async function resolveUninstallTargetAsync(app) {
 
         return {
             kind: 'flatpak',
-            label: desktopId,
+            label: safeLabel(desktopId),
             getArgv: (extraArgs = []) => {
                 const baseFlatpakCmd = isUserFlatpak
                     ? ['flatpak', 'uninstall', '--user', '-y', ...extraArgs, desktopId]
@@ -328,7 +334,7 @@ async function resolveUninstallTargetAsync(app) {
 
         return {
             kind: 'snap',
-            label: snapName,
+            label: safeLabel(snapName),
             getArgv: () => makeCombinedArgv(true, ['/usr/bin/snap', 'remove', snapName]),
         };
     }
@@ -336,7 +342,7 @@ async function resolveUninstallTargetAsync(app) {
     // 6. 兜底方案
     return {
         kind: 'standalone',
-        label: baseName,
+        label: safeLabel(baseName),
         getArgv: () => makeCombinedArgv(!isUserDesktop, ['true'])
     };
 }
@@ -421,9 +427,11 @@ class SystemConfirmDialog extends ModalDialog.ModalDialog {
         }
 
         if (showPackageName) {
+            let packageText = packageName || appName || getTranslation(pluginDir, 'unknown_app');
             let packageLabel = new St.Label({
-                style: `font-size: 9pt; color: rgba(255, 255, 255, 0.35); ${showAppName ? 'margin-top: 4px;' : ''}`,
-                text: packageName,
+                style_class: 'end-session-dialog-description',
+                style: `font-size: 9pt; ${showAppName ? 'margin-top: 4px;' : ''}`,
+                text: packageText,
                 x_align: Clutter.ActorAlign.CENTER
             });
             descBox.add_child(packageLabel);

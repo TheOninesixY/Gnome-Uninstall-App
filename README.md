@@ -1,6 +1,6 @@
-# ![](./.readme/logo.png) fastUninstallApp 
+# ![](https://raw.githubusercontent.com/TheOninesixY/Gnome-Uninstall-App/refs/heads/main/.readme/logo.png) fastUninstallApp 
 ### 一键卸载应用
-![image](./.readme/截图.png)
+![image]([./.readme/截图.png](https://raw.githubusercontent.com/TheOninesixY/Gnome-Uninstall-App/refs/heads/main/.readme/%E6%88%AA%E5%9B%BE.png))
 ## 简介
 呃……我不知道要怎么写...不过，我需要说的是：这个插件确实是VibeCoding的！好了我现在说了！不要再拿这个来轰炸我了！不要再拿这个来轰炸我了！
 ## 使用方法
